@@ -231,6 +231,10 @@ class WatchdogAnalyzer:
         self._verdict_history.append(verdict_safe)
         return verdict_safe
 
+    def record_verdict(self, verdict: "AnomalyVerdict") -> None:
+        """Record a verdict produced outside audit_step (e.g. the incremental stream guard)."""
+        self._verdict_history.append(verdict)
+
     def get_stats(self) -> Dict[str, Any]:
         total = len(self._verdict_history)
         anomalies = [v for v in self._verdict_history if v.is_anomaly]

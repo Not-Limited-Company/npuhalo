@@ -1,0 +1,48 @@
+# Git & harness metadata
+.git
+.gitignore
+.github
+.omo
+
+# Research outputs and large artifacts (not needed to run the proxy)
+results/
+verifier/results/
+verifier/data/archive/
+docs/assets/
+benchmarks/
+standalone-eval/
+patches/
+engram-npu-prep/
+tests/
+examples/
+
+# Python caches & environments
+__pycache__/
+*.py[cod]
+.venv/
+env/
+venv/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Model weights & runtime artifacts
+*.gguf
+*.q4nx
+*.safetensors
+*.bin
+*.pt
+*.xclbin
+models/
+hf/
+gh/
+*.log
+*.tmp
+*.sock
+*.pid
+
+# Editors
+.vscode/
+.idea/
+.DS_Store

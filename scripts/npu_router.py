@@ -13,7 +13,7 @@ import json
 import time
 import asyncio
 import aiohttp
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 DEFAULT_NPU_URL = "http://127.0.0.1:8001"
 DEFAULT_NPU_MODEL = "qwen3.5:0.8b"
@@ -67,30 +67,43 @@ class HybridNPURouter:
         connector = aiohttp.TCPConnector(force_close=True)
         self.session = aiohttp.ClientSession(connector=connector)
 
-    async def classify(self, text: str) -> Dict[str, Any]:
+    def deterministic_route(self, text: str) -> Optional[Dict[str, Any]]:
+        """Zero-cost regex decision with no network calls. None when no rule applies.
+
+        This is the only part of routing that is safe to consult on every request:
+        it cannot make the NPU model's judgement part of the critical path.
+        """
         t0 = time.perf_counter()
-        
-        # 1. Check GPU hard deterministic rules (0ms)
+
+        # 1. Patterns that unequivocally require the primary (GPU) model
         for pat in GPU_HARD_PATTERNS:
             if pat.search(text):
-                elapsed_ms = (time.perf_counter() - t0) * 1000
                 return {
                     "route": "gpu",
                     "method": "deterministic_rule",
                     "reason": f"Matched GPU requirement: {pat.pattern[:40]}",
-                    "latency_ms": elapsed_ms,
+                    "latency_ms": (time.perf_counter() - t0) * 1000,
                 }
 
-        # 2. Check NPU hard deterministic rules (0ms)
+        # 2. Patterns that are trivially handled by the small NPU model
         for pat in NPU_HARD_PATTERNS:
             if pat.search(text):
-                elapsed_ms = (time.perf_counter() - t0) * 1000
                 return {
                     "route": "npu",
                     "method": "deterministic_rule",
                     "reason": f"Matched NPU fast-lane: {pat.pattern[:40]}",
-                    "latency_ms": elapsed_ms,
+                    "latency_ms": (time.perf_counter() - t0) * 1000,
                 }
+
+        return None
+
+    async def classify(self, text: str) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+
+        # 1./2. Deterministic rules first (0ms, no network).
+        decision = self.deterministic_route(text)
+        if decision is not None:
+            return decision
 
         # 3. Fallback: NPU Few-Shot Semantic Classification (~2-4W)
         if self.session:
