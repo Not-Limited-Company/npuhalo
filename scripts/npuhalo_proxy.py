@@ -43,6 +43,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "verifier", "src"))
 from watchdog_analyzer import WatchdogAnalyzer, AnomalyVerdict
 from npu_router import HybridNPURouter
 from compressor_sidecar import DualCompressorSidecar
+from energy import EnergyMeter
 
 # Backend lanes. They key the telemetry counters and the lane tags in response ids.
 LOCAL_GPU = "gpu"
@@ -90,6 +91,10 @@ def new_response_id(lane: str = "") -> str:
 # Content-part types that carry pixels. Two client APIs spell the image part differently and both
 # reach this proxy, so the set is what "this request has an image" means here.
 IMAGE_PART_TYPES = frozenset({"image_url", "input_image", "image"})
+
+# Where the per-request energy record is appended. The compose already mounts this directory as
+# NPUHALO_ARTIFACTS_DIR, so the record is readable on the host without another mount.
+DEFAULT_ENERGY_LOG = "/tmp/npuhalo-compressor-artifacts/energy.jsonl"
 
 
 def request_has_image(messages: Any) -> bool:
@@ -158,6 +163,7 @@ class NPUHaloProxy:
         enable_compressor: bool = False,
         max_body_mb: int = DEFAULT_MAX_BODY_MB,
         image_target: str = LOCAL_NPU,
+        energy_log: Optional[str] = None,
     ):
         self.gpu_url = gpu_url.rstrip("/")
         self.npu_url = npu_url.rstrip("/")
@@ -177,6 +183,11 @@ class NPUHaloProxy:
         # Which local backend serves an image-bearing request. The vision model is the only one
         # here that can read pixels, so this switches between the NPU and the GPU, not on/off.
         self.image_target = image_target
+        # Per-request package energy. The meter samples the socket power sensor while a request is
+        # in flight and integrates it; a missing sensor degrades the record, never the request.
+        self.energy = EnergyMeter()
+        self.energy_log = energy_log or os.environ.get("NPUHALO_ENERGY_LOG") or DEFAULT_ENERGY_LOG
+        self._energy_lock = asyncio.Lock()
 
 
         if "minicpm" in self.npu_model.lower():
@@ -206,13 +217,16 @@ class NPUHaloProxy:
         self.session = aiohttp.ClientSession(connector=connector)
         if self.router:
             await self.router.start()
+        await self.energy.start()
         logger.info(
             f"NPUHalo Proxy initialized | GPU={self.gpu_url} ({self.gpu_model}) | "
             f"NPU={self.npu_url} ({self.npu_model}) for models {sorted(self.npu_model_names) or ['<none>']} | "
-            f"GuardMode={self.guard_mode} | ImageTarget={self.image_target}"
+            f"GuardMode={self.guard_mode} | ImageTarget={self.image_target} | "
+            f"Energy={self.energy.sensor_path or 'sensor unavailable'}"
         )
 
     async def stop(self):
+        await self.energy.stop()
         if self.session:
             await self.session.close()
         if self.router:
@@ -357,6 +371,18 @@ class NPUHaloProxy:
         backend = selection["backend"]
         payload = selection["payload"]
         headers = {"Content-Type": "application/json", **selection.get("auth_headers", {})}
+        selection["requested_model"] = body.get("model")
+
+        # Ask the upstream for token usage even when the client did not. Both lanes report usage on
+        # a streamed response only when asked, and without the token count the energy record cannot
+        # be an energy-per-token record. A client that did not ask does not see it: the streaming
+        # path drops the usage-only chunk before forwarding it.
+        wants_usage = bool((body.get("stream_options") or {}).get("include_usage"))
+        selection["wants_usage"] = wants_usage
+        if stream:
+            options = dict(payload.get("stream_options") or {})
+            options["include_usage"] = True
+            payload["stream_options"] = options
 
         # The routing record, and the authoritative answer to "where did this actually run".
         #
@@ -392,32 +418,48 @@ class NPUHaloProxy:
         runner = self._handle_streaming_completion if stream else self._handle_non_streaming_completion
         args = (request, selection, headers, session_id, user_prompt)
 
-        try:
-            return await runner(*args)
-        except (FALLBACK_ERRORS + (UpstreamUnusable,)) as e:
-            logger.error(f"Backend '{backend}' unusable: {type(e).__name__}: {e}")
-            if backend == LOCAL_NPU and selection.get("allow_fallback"):
-                # Router gating is a power optimisation, so a failed NPU attempt may be
-                # retried on the primary GPU model.
-                logger.warning(f"Falling back to {self.gpu_model}")
-                self._backend_counts["gpu"] = self._backend_counts.get("gpu", 0) + 1
-                local = self._gpu_selection(payload)
-                local["extra_headers"] = dict(selection.get("extra_headers", {}))
-                try:
-                    return await runner(
-                        request, local, {"Content-Type": "application/json"},
-                        session_id, user_prompt,
+        # Meter the request across both lanes and both paths. The meter's own finally runs when
+        # this block exits, so the measurement is complete before the record is written below --
+        # and for a streamed response this block is not exited until every chunk has been written.
+        served = selection
+        served_backend = backend
+        response: Optional[web.StreamResponse] = None
+        async with self.energy.measure() as measurement:
+            try:
+                response = await runner(*args)
+            except (FALLBACK_ERRORS + (UpstreamUnusable,)) as e:
+                logger.error(f"Backend '{backend}' unusable: {type(e).__name__}: {e}")
+                if backend == LOCAL_NPU and selection.get("allow_fallback"):
+                    # Router gating is a power optimisation, so a failed NPU attempt may be
+                    # retried on the primary GPU model.
+                    logger.warning(f"Falling back to {self.gpu_model}")
+                    self._backend_counts["gpu"] = self._backend_counts.get("gpu", 0) + 1
+                    local = self._gpu_selection(payload)
+                    local["extra_headers"] = dict(selection.get("extra_headers", {}))
+                    local["wants_usage"] = wants_usage
+                    local["requested_model"] = selection["requested_model"]
+                    served, served_backend = local, LOCAL_GPU
+                    try:
+                        response = await runner(
+                            request, local, {"Content-Type": "application/json"},
+                            session_id, user_prompt,
+                        )
+                    except FALLBACK_ERRORS as e2:
+                        logger.error(f"GPU fallback also failed: {type(e2).__name__}: {e2}")
+                        response = web.json_response(
+                            {"error": f"upstream unavailable: {e2}"}, status=502)
+                else:
+                    # Explicitly requested NPU model (or a GPU failure): fail loudly rather than
+                    # silently answering with a different model.
+                    response = web.json_response(
+                        {"error": f"{backend} backend unavailable: {e}", "backend": backend},
+                        status=502,
                     )
-                except FALLBACK_ERRORS as e2:
-                    logger.error(f"GPU fallback also failed: {type(e2).__name__}: {e2}")
-                    return web.json_response(
-                        {"error": f"upstream unavailable: {e2}"}, status=502)
-            # Explicitly requested NPU model (or a GPU failure): fail loudly rather than
-            # silently answering with a different model.
-            return web.json_response(
-                {"error": f"{backend} backend unavailable: {e}", "backend": backend},
-                status=502,
-            )
+
+        await self._record_energy(
+            measurement, served, served_backend, correlation, session_id, stream, user_prompt
+        )
+        return response
 
     # ---- request handling ----------------------------------------------------
     @staticmethod
@@ -461,6 +503,113 @@ class NPUHaloProxy:
         if upstream_model:
             headers["X-NPUHalo-Upstream-Model"] = str(upstream_model)
         return headers
+
+    # ---- energy record -------------------------------------------------------
+    @staticmethod
+    def _is_usage_only_chunk(chunk: bytes) -> bool:
+        """True for the final SSE chunk that carries usage and no choices.
+
+        Cheap substring test on purpose: this runs on the streaming path, where the code
+        deliberately avoids re-parsing JSON.
+        """
+        if b'"usage"' not in chunk:
+            return False
+        return b'"choices":[]' in chunk or b'"choices": []' in chunk
+
+    @staticmethod
+    def _extract_usage(text: str) -> Optional[dict]:
+        """The token usage object from an SSE body or a JSON completion, if the upstream sent one.
+
+        Both lanes report usage on a stream only when asked, which is why the request asks; this is
+        the read side of that. FastFlowLM's block also carries `prefill_duration_ttft` and
+        `decoding_duration`, so the prefill/decode split comes free on the NPU lane.
+        """
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if not line.startswith("data:") or '"usage"' not in line:
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                usage = json.loads(payload).get("usage")
+            except ValueError:
+                continue
+            if isinstance(usage, dict):
+                return usage
+        if '"usage"' in text:
+            try:
+                usage = json.loads(text).get("usage")
+            except ValueError:
+                return None
+            if isinstance(usage, dict):
+                return usage
+        return None
+
+    def classify_tier(self, text: str) -> str:
+        """A coarse bucket for this request, recorded beside the energy.
+
+        LiteLLM's complexity router decides the real tier, but it does not persist it: the
+        `router_metadata` and `routing_decision` slots it stamps into the spend log are JSON null
+        on every row, and the tier lives only in the router's in-memory decision (see
+        docs/ENERGY.md). So this bucket is the shim's own -- the same kind of keyword test the
+        router's heuristic classifier uses -- and every record says `tier_source=shim-heuristic`
+        so nobody mistakes it for the router's answer.
+        """
+        if not isinstance(text, str) or not text.strip():
+            return "empty"
+        return "simple" if self._is_trivial_query(text) else "complex"
+
+    async def _record_energy(
+        self,
+        measurement,
+        selection: Dict[str, Any],
+        backend: str,
+        correlation: str,
+        session_id: str,
+        stream: bool,
+        user_prompt: Any,
+    ) -> None:
+        """Append the per-request energy record, and put its numbers on the routing line.
+
+        Two destinations on purpose: the log line is what a human reads, and the JSONL is what the
+        report tool and the spend-log reconciler read. Neither is on the response path.
+        """
+        usage = selection.get("usage") if isinstance(selection, dict) else None
+        usage = usage if isinstance(usage, dict) else {}
+        prefill_s = usage.get("prefill_duration_ttft")
+        decode_s = usage.get("decoding_duration")
+        record = {
+            "ts": time.time(),
+            "correlation": correlation or f"session:{session_id}",
+            "lane": backend,
+            "requested_model": selection.get("requested_model"),
+            "upstream_model": selection.get("upstream_model"),
+            "reason": selection.get("reason"),
+            "stream": bool(stream),
+            "tier": self.classify_tier(user_prompt),
+            "tier_source": "shim-heuristic",
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "prefill_ms": round(prefill_s * 1000, 2) if isinstance(prefill_s, (int, float)) else None,
+            "decode_ms": round(decode_s * 1000, 2) if isinstance(decode_s, (int, float)) else None,
+            **measurement.as_dict(),
+        }
+        logger.info(
+            "energy lane=%s tier=%s joules=%s marginal_joules=%s idle_w=%s duration_ms=%s "
+            "tokens=%s+%s samples=%s concurrent=%s",
+            record["lane"], record["tier"], record["energy_j"], record["energy_marginal_j"],
+            record["energy_idle_w"], round(measurement.duration_s * 1000, 1),
+            record["prompt_tokens"], record["completion_tokens"], record["energy_samples"],
+            record["energy_concurrent"],
+        )
+        try:
+            async with self._energy_lock:
+                with open(self.energy_log, "a") as handle:
+                    handle.write(json.dumps(record, default=str) + "\n")
+        except OSError as e:
+            # A log that cannot be written must not fail a request that has already been answered.
+            logger.warning(f"energy: could not append to {self.energy_log}: {e}")
 
     async def _handle_streaming_completion(
         self,
@@ -509,6 +658,7 @@ class NPUHaloProxy:
                         headers=route_headers,
                     )
                 data["id"] = response_id
+                selection["usage"] = data.get("usage")
                 wrapped = self._json_to_sse(data, fallback_model=payload.get("model", "")).encode("utf-8")
 
             response = web.StreamResponse(status=200, headers={**SSE_HEADERS, **route_headers})
@@ -542,6 +692,11 @@ class NPUHaloProxy:
                             if blocked_verdict is not None:
                                 break
 
+                        # The usage-only chunk is what we asked the upstream for on the client's
+                        # behalf; a client that did not ask for it must not see it.
+                        if not selection.get("wants_usage") and self._is_usage_only_chunk(chunk):
+                            continue
+
                         await response.write(chunk)
 
                 if blocked_verdict is not None:
@@ -560,6 +715,8 @@ class NPUHaloProxy:
                 full_raw = b"".join(accumulated_chunks).decode("utf-8", errors="replace")
                 generated_text = self._extract_text_from_sse(full_raw)
                 stream_ms = (time.perf_counter() - t0) * 1000
+                if selection.get("usage") is None:
+                    selection["usage"] = self._extract_usage(full_raw)
 
                 # Schedule Out-of-Loop NPU Audit Task (0ms delay to client stream)
                 prompt_text = user_prompt if isinstance(user_prompt, str) else ""
@@ -618,6 +775,7 @@ class NPUHaloProxy:
                 )
 
             generated_text = (choices[0].get("message") or {}).get("content", "") or ""
+            selection["usage"] = data.get("usage") if isinstance(data, dict) else None
 
             prompt_text = user_prompt if isinstance(user_prompt, str) else ""
             verdict = await self.watchdog.audit_step(session_id, prompt_text, generated_text, session=self.session)
@@ -760,6 +918,11 @@ def main():
     parser.add_argument("--enable-router", action="store_true", help="Additionally route unrouted 'trivial' queries to the NPU (can downgrade quality)")
     parser.add_argument("--enable-compressor", action="store_true", help="Enable in-flight NPU prompt compression for long inputs (>16k chars)")
     parser.add_argument(
+        "--energy-log", default=None,
+        help="Append the per-request energy record here "
+             f"(default: {DEFAULT_ENERGY_LOG}, or NPUHALO_ENERGY_LOG)",
+    )
+    parser.add_argument(
         "--max-body-mb", type=int, default=DEFAULT_MAX_BODY_MB, metavar="MB",
         help=f"Maximum request body size in MiB (default: {DEFAULT_MAX_BODY_MB}). Images are base64-encoded and inflate ~1.37x",
     )
@@ -787,6 +950,7 @@ def main():
         enable_compressor=args.enable_compressor,
         max_body_mb=args.max_body_mb,
         image_target=args.private_image_target,
+        energy_log=args.energy_log,
     )
 
     app = create_app(proxy)
@@ -811,6 +975,9 @@ def main():
     print(f"  Compressor   : {'ENABLED' if args.enable_compressor else 'DISABLED'}")
     print(f"  Max body     : {args.max_body_mb} MiB")
     print(f"  Image lane   : {args.private_image_target.upper()}")
+    print(f"  Energy       : {proxy.energy.sensor_path or 'sensor unavailable'}"
+          f" (sampled every {proxy.energy.interval_s}s)")
+    print(f"  Energy log   : {proxy.energy_log}")
     print("========================================================\n")
 
     web.run_app(app, host=args.host, port=args.port)
